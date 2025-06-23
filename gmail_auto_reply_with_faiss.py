@@ -1,4 +1,6 @@
 import os
+import re
+import time
 import time
 import base64
 import faiss
@@ -8,6 +10,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
+from google.auth.transport.requests import requests
 from sentence_transformers import SentenceTransformer
 
 # Gmail API scope for reading emails and creating drafts
@@ -16,9 +19,11 @@ SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
 # Initialize the sentence transformer model for embeddings
 model = SentenceTransformer('all-MiniLM-L6-v2')
 
-# Define email templates
+# Define email templates with {sender_name} placeholder
 EMAIL_TEMPLATES = [
     """
+Dear {sender_name},
+
 Thank you for your email regarding
 
 We will schedule a meeting at your earliest convenience to discuss this further.
@@ -27,23 +32,28 @@ Best regards,
 [Your Name]
     """,  # Template 1: Meeting request
     """
+Dear {sender_name},
+
 Thank you for reaching out with your support inquiry. We have received your request and will respond within 24-48 hours.
 
 Best regards,
 [Your Name]
     """,  # Template 2: Support inquiry
     """
+Dear {sender_name},
+
 Thank you for your email. I'll get back to you soon with more details.
 
 Best regards,
-[Your Name]
+[Your Email]
     """,  # Template 3: General reply
 ]
 
 # Create FAISS index and add template embeddings
 def initialize_faiss_index(templates):
-    # Convert templates to embeddings
-    template_embeddings = model.encode(templates)
+    # Convert templates to embeddings (strip placeholders for cleaner embeddings)
+    clean_templates = [re.sub(r'{sender_name}', '', template) for template in templates]
+    template_embeddings = model.encode(clean_templates)
     # Create a FAISS index (using L2 distance)
     dimension = template_embeddings.shape[1]  # Embedding dimension
     index = faiss.IndexFlatL2(dimension)
@@ -91,6 +101,14 @@ def get_thread_details(service, thread_id):
         message_id = next((header['value'] for header in headers if header['name'] == 'Message-ID'), '')
         date = next((header['value'] for header in headers if header['name'] == 'Date'), '')
         
+        # Extract sender's name from 'From' header
+        sender_name = ''
+        match = re.match(r'(.+?)\s*<\S+@[\S\.]+>', from_email)
+        if match:
+            sender_name = match.group(1).strip('"').strip()
+        else:
+            sender_name = from_email.split('@')[0]  # Fallback to email username if no name is found
+        
         # Extract message body (simplified, assumes text/plain part)
         body = ''
         if 'parts' in msg['payload']:
@@ -103,6 +121,7 @@ def get_thread_details(service, thread_id):
         
         thread_details.append({
             'from': from_email,
+            'sender_name': sender_name,  # Add sender_name to thread details
             'subject': subject,
             'body': body,
             'message_id': message_id,
@@ -121,9 +140,10 @@ def select_template(thread_content):
     best_template_idx = indices[0][0]
     return EMAIL_TEMPLATES[best_template_idx]
 
-def create_draft_reply(service, to_email, subject, thread_id, latest_message_id, thread_details, reply_content):
+def create_draft_reply(service, to_email, subject, thread_id, latest_message_id, thread_details, reply_content, sender_name):
     """Create a draft reply for the email thread."""
-    # Use the selected template as the reply content
+    # Use the selected template as the reply content, replacing {sender_name}
+    reply_content = reply_content.format(sender_name=sender_name)
     latest_message = thread_details[-1]
     message = MIMEText(reply_content + f"\n\n> On {latest_message['date']}, {latest_message['from']} wrote:\n> {latest_message['body']}")
     message['to'] = to_email
@@ -175,15 +195,16 @@ def main():
                     latest_message = thread_details[-1]
                     to_email = latest_message['from']
                     subject = latest_message['subject']
+                    sender_name = latest_message['sender_name']  # Get sender's name
                     
-                    print(f"Thread contains {len(thread_details)} messages. Latest from: {to_email}, Subject: {subject}")
+                    print(f"Thread contains {len(thread_details)} messages. Latest from: {to_email}, Name: {sender_name}, Subject: {subject}")
                     
                     # Select the most relevant template
                     reply_content = select_template(thread_content)
                     print(f"Selected template: {reply_content.splitlines()[1]}...")  # Print first line of template for logging
                     
                     # Create draft reply
-                    draft = create_draft_reply(service, to_email, subject, thread_id, latest_message_id, thread_details, reply_content)
+                    draft = create_draft_reply(service, to_email, subject, thread_id, latest_message_id, thread_details, reply_content, sender_name)
                     print(f"Draft created for thread {thread_id}. Draft ID: {draft['id']}")
                     
                     # Mark the specific email as read
